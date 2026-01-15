@@ -2,4 +2,4 @@ streamlit
 google-generativeai
 pandas
 gspread
-oauth2client
+google-auth
