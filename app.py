@@ -4,11 +4,11 @@ import pandas as pd
 import json
 import os
 import gspread
-from google.oauth2.service_account import Credentials # Thư viện mới ổn định hơn
+from google.oauth2.service_account import Credentials # Thư viện Auth mới
 from datetime import datetime, time
 
 # --- 1. CẤU HÌNH & CSS ---
-st.set_page_config(page_title="MFG Commander v7.0", page_icon="🏭", layout="wide")
+st.set_page_config(page_title="MFG Commander v8.0", page_icon="🏭", layout="wide")
 
 st.markdown("""
 <style>
@@ -20,44 +20,35 @@ st.markdown("""
         margin-bottom: 10px;
         border-left: 5px solid #4285f4;
     }
-    .time-badge {
-        background-color: #e8f0fe;
-        color: #1967d2;
+    .status-tag {
+        display: inline-block;
         padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.85em;
+        border-radius: 4px;
+        font-size: 0.8em;
         font-weight: bold;
-    }
-    .expired-badge {
-        background-color: #fce8e6;
-        color: #c5221f;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.85em;
-        font-weight: bold;
+        color: white;
     }
 </style>
 """, unsafe_allow_html=True)
 
 DB_FILE = "tasks_db.json"
 
-# --- 2. XỬ LÝ KẾT NỐI (FIX LỖI GOOGLE SHEET) ---
+# --- 2. KẾT NỐI GOOGLE SHEET (CHUẨN MỚI) ---
 def get_api_key():
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
     return None
 
 def connect_google_sheet():
-    # Scope chuẩn cho Google Sheet
+    # Define Scope chuẩn
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
     
     try:
-        # Cách kết nối mới dùng google-auth (Ổn định trên Cloud)
+        # Ưu tiên lấy từ Secrets (Cloud)
         if "gcp_service_account" in st.secrets:
-            # Tạo credentials từ secrets dictionary
             creds = Credentials.from_service_account_info(
                 st.secrets["gcp_service_account"],
                 scopes=scopes
@@ -65,10 +56,16 @@ def connect_google_sheet():
             client = gspread.authorize(creds)
             sheet = client.open("MFG_Task_Database").sheet1
             return sheet, "Success"
+        # Fallback local (file json)
+        elif os.path.exists("credentials.json"):
+            creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+            client = gspread.authorize(creds)
+            sheet = client.open("MFG_Task_Database").sheet1
+            return sheet, "Success"
         else:
-            return None, "⚠️ Chưa cấu hình Secrets trên Cloud."
+            return None, "⚠️ Chưa cấu hình Secrets/Credentials."
     except Exception as e:
-        return None, f"Lỗi kết nối: {str(e)}"
+        return None, f"Lỗi Auth: {str(e)}"
 
 def sync_to_gsheet(tasks):
     sheet, msg = connect_google_sheet()
@@ -76,11 +73,12 @@ def sync_to_gsheet(tasks):
         try:
             if not tasks: return True, "Trống"
             df = pd.DataFrame(tasks)
-            
-            # Xử lý Subtask (List Dict -> String) để hiển thị trên Excel cho gọn
+            # Chuyển Checklist thành text để lưu lên Sheet dễ đọc
             if 'subtasks' in df.columns:
-                df['subtasks'] = df['subtasks'].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, list) else str(x))
-            
+                df['subtasks'] = df['subtasks'].apply(
+                    lambda x: "\n".join([f"[{'x' if i.get('done') else ' '}] {i.get('name')}" for i in x]) 
+                    if isinstance(x, list) else str(x)
+                )
             df = df.astype(str)
             sheet.clear()
             sheet.update([df.columns.values.tolist()] + df.values.tolist())
@@ -89,21 +87,20 @@ def sync_to_gsheet(tasks):
             return False, str(e)
     return False, msg
 
-# --- 3. DATABASE & LOGIC ---
+# --- 3. DATABASE & AI LOGIC ---
 def load_tasks():
     if not os.path.exists(DB_FILE): return []
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # MIGRATION: Chuyển đổi dữ liệu cũ (List String) sang mới (List Dict)
+            # Fix lỗi cấu trúc dữ liệu cũ
             for t in data:
+                if "subtasks" not in t: t["subtasks"] = []
+                # Convert list string cũ sang list object mới
                 new_subs = []
-                if "subtasks" in t and isinstance(t["subtasks"], list):
-                    for item in t["subtasks"]:
-                        if isinstance(item, str): # Nếu là kiểu cũ
-                            new_subs.append({"name": item, "done": False})
-                        else: # Nếu đã là kiểu mới
-                            new_subs.append(item)
+                for s in t["subtasks"]:
+                    if isinstance(s, str): new_subs.append({"name": s, "done": False})
+                    else: new_subs.append(s)
                 t["subtasks"] = new_subs
             return data
     except: return []
@@ -112,184 +109,195 @@ def save_tasks(tasks):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(tasks, f, ensure_ascii=False, indent=2)
 
-def calculate_time_left(deadline_str):
-    try:
-        deadline = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
-        now = datetime.now()
-        
-        if now > deadline:
-            return "expired", f"Đã quá hạn"
-        
-        diff = deadline - now
-        days = diff.days
-        hours = diff.seconds // 3600
-        minutes = (diff.seconds // 60) % 60
-        
-        if days > 0:
-            return "valid", f"Còn {days} ngày {hours} giờ"
-        else:
-            return "valid", f"Còn {hours} giờ {minutes} phút"
-    except:
-        return "error", "Lỗi ngày tháng"
-
 def analyze_task_ai(api_key, text, deadline):
     genai.configure(api_key=api_key)
+    # Prompt cực mạnh để ép ra Subtask
     prompt = f"""
-    Input: "{text}". Deadline: "{deadline}".
-    Yêu cầu: Trả về JSON Object (Không List).
-    JSON Schema: 
-    {{ "task_name": "", "description": "Mô tả ngắn", "priority": "High/Medium/Low", "eisenhower": "Q1/Q2/Q3/Q4", "subtasks": ["Bước 1", "Bước 2", "Bước 3"] }}
+    Input Task: "{text}"
+    Deadline: "{deadline}"
+    
+    YÊU CẦU BẮT BUỘC:
+    1. Chia nhỏ task này thành 3-5 bước thực hiện cụ thể (subtasks).
+    2. Subtasks KHÔNG ĐƯỢC RỖNG. Nếu task quá đơn giản, hãy bịa ra các bước kiểm tra.
+    
+    Output JSON Schema:
+    {{ 
+        "task_name": "Tên ngắn gọn", 
+        "description": "Mô tả chi tiết mục tiêu", 
+        "priority": "High/Medium/Low", 
+        "eisenhower": "Q1/Q2/Q3/Q4", 
+        "subtasks": ["Bước 1...", "Bước 2...", "Bước 3..."] 
+    }}
     """
     
-    # Thử model mới nhất, fallback về 1.5
-    for model_name in ['gemini-2.0-flash-exp', 'gemini-1.5-flash']:
+    for model_name in ['gemini-2.5-flash', 'gemini-2.5-flash']:
         try:
             model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
             response = model.generate_content(prompt)
             data = json.loads(response.text.strip())
+            if isinstance(data, list): data = data[0]
             
-            if isinstance(data, list): data = data[0] # Fix lỗi trả về List
-            
-            # CHUẨN HÓA SUBTASK NGAY TẠI ĐÂY
-            # Biến ["Bước 1"] thành [{"name": "Bước 1", "done": False}]
-            final_subtasks = []
-            if "subtasks" in data and isinstance(data["subtasks"], list):
-                for s in data["subtasks"]:
-                    final_subtasks.append({"name": str(s), "done": False})
-            data["subtasks"] = final_subtasks
+            # Chuẩn hóa Checklist ngay lập tức
+            final_subs = []
+            raw_subs = data.get("subtasks", [])
+            if isinstance(raw_subs, list):
+                for s in raw_subs: final_subs.append({"name": str(s), "done": False})
+            data["subtasks"] = final_subs
             
             return data
         except: continue
     return None
 
-# --- 4. GIAO DIỆN CHÍNH ---
+# --- 4. GIAO DIỆN CHÍNH (TAB VIEW) ---
 
 with st.sidebar:
     st.header("⚙️ Cài đặt")
     api_key = get_api_key()
-    if api_key: st.success("✅ Đã nạp API Key")
+    if api_key: st.success("✅ API Key Ready")
     else: api_key = st.text_input("Gemini API Key", type="password")
     
     st.divider()
-    if st.button("🔄 Force Sync Cloud"):
+    if st.button("🔄 Force Sync Google Sheet"):
         t = load_tasks()
         ok, m = sync_to_gsheet(t)
         if ok: st.toast(m, icon="☁️")
         else: st.error(m)
 
-st.title("🏭 MFG Copilot Mobile v7")
+st.title("🏭 MFG Commander v8")
 
-# FORM ADD TASK
-with st.expander("➕ THÊM TASK MỚI", expanded=True):
-    new_task = st.text_input("Nội dung công việc")
-    c1, c2 = st.columns(2)
-    with c1: d_date = st.date_input("Ngày", value=datetime.now())
-    with c2: d_time = st.time_input("Giờ", value=time(17, 0))
-    
-    if st.button("🚀 Thêm Task", type="primary", use_container_width=True):
-        if not api_key: st.error("Thiếu Key")
-        elif not new_task: st.warning("Nhập nội dung task")
-        else:
-            with st.spinner("AI đang xử lý..."):
-                dl = f"{d_date} {d_time.strftime('%H:%M')}"
-                res = analyze_task_ai(api_key, new_task, dl)
-                
-                if res and isinstance(res, dict):
-                    tasks = load_tasks()
-                    new_item = {
-                        "id": len(tasks)+1, "status": "Pending", 
-                        "created_at": str(datetime.now().date()), "deadline": dl, 
-                        **res
-                    }
-                    tasks.append(new_item)
-                    save_tasks(tasks)
-                    sync_to_gsheet(tasks)
-                    st.toast("Thêm thành công!", icon="✅")
-                    st.rerun()
+# --- TAB NAVIGATION ---
+tab1, tab2, tab3 = st.tabs(["📝 Công việc", "🎯 Ma trận Ưu tiên", "📊 Dashboard"])
 
-# VIEW TASKS
-st.divider()
-view_mode = st.radio("Chế độ:", ["📱 Mobile", "💻 Desktop"], horizontal=True)
 tasks = load_tasks()
-pending_tasks = [t for t in tasks if t.get('status') != 'Done']
 
-if view_mode == "📱 Mobile":
-    st.caption(f"Đang có {len(pending_tasks)} task cần làm")
+# === TAB 1: NHẬP LIỆU & LIST ===
+with tab1:
+    with st.expander("➕ THÊM TASK MỚI", expanded=True):
+        new_task = st.text_input("Nội dung công việc")
+        c1, c2 = st.columns(2)
+        with c1: d_date = st.date_input("Ngày", value=datetime.now())
+        with c2: d_time = st.time_input("Giờ", value=time(17, 0))
+        
+        if st.button("🚀 Thêm Task", type="primary", use_container_width=True):
+            if not api_key: st.error("Thiếu API Key")
+            elif not new_task: st.warning("Nhập nội dung")
+            else:
+                with st.spinner("AI đang chia nhỏ công việc..."):
+                    dl = f"{d_date} {d_time.strftime('%H:%M')}"
+                    res = analyze_task_ai(api_key, new_task, dl)
+                    if res:
+                        tasks = load_tasks()
+                        tasks.append({
+                            "id": int(datetime.now().timestamp()), # ID theo thời gian để không trùng
+                            "status": "Pending",
+                            "created_at": str(datetime.now().date()),
+                            "deadline": dl,
+                            **res
+                        })
+                        save_tasks(tasks)
+                        sync_to_gsheet(tasks)
+                        st.rerun()
+
+    st.subheader("Danh sách cần làm")
+    pending_tasks = [t for t in tasks if t['status'] != 'Done']
     
     for t in reversed(pending_tasks):
-        b_color = "#ff4b4b" if t.get('priority') == 'High' else "#3373c4"
-        
-        # Tính thời gian còn lại
-        time_status, time_text = calculate_time_left(t.get('deadline'))
-        badge_class = "expired-badge" if time_status == "expired" else "time-badge"
-        
+        color = "#ff4b4b" if t['priority'] == 'High' else "#3373c4"
         with st.container():
             st.markdown(f"""
-            <div style="background:white; padding:15px; border-radius:10px; border-left: 5px solid {b_color}; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom:10px;">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <div style="font-weight:bold; font-size:1.1em;">{t.get('task_name')}</div>
-                    <span class="{badge_class}">{time_text}</span>
-                </div>
-                <div style="color:#666; font-size:0.85em; margin: 5px 0;">
-                    🔥 {t.get('priority')} | 📂 {t.get('eisenhower')}
-                </div>
-                <div style="margin-top:5px; font-size:0.95em">{t.get('description')}</div>
+            <div style="background:white; padding:15px; border-radius:10px; border-left: 5px solid {color}; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom:10px;">
+                <div style="font-weight:bold; font-size:1.1em;">{t['task_name']}</div>
+                <div style="color:#666; font-size:0.85em;">⏳ {t['deadline']} | {t['eisenhower']}</div>
             </div>
             """, unsafe_allow_html=True)
             
-            # CHECKLIST TƯƠNG TÁC
-            with st.expander("✅ Checklist & Tiến độ"):
-                # Subtask Logic
-                subtasks = t.get('subtasks', [])
-                updated_subtasks = []
+            with st.expander("✅ Checklist & Hành động"):
+                st.info(t.get('description', ''))
+                
+                # CHECKLIST INTERACTIVE
+                subs = t.get('subtasks', [])
+                updated_subs = []
                 has_change = False
+                done_count = 0
                 
-                completed_count = 0
-                
-                # Render checkbox cho từng subtask
-                for i, sub in enumerate(subtasks):
-                    # Đảm bảo sub là dict (đã xử lý ở hàm load_tasks)
-                    is_done = st.checkbox(
-                        sub['name'], 
-                        value=sub['done'], 
-                        key=f"chk_{t['id']}_{i}"
-                    )
-                    
-                    if is_done: completed_count += 1
-                    
-                    # Nếu trạng thái thay đổi, đánh dấu để save
-                    if is_done != sub['done']:
-                        sub['done'] = is_done
+                for i, s in enumerate(subs):
+                    is_done = st.checkbox(s['name'], value=s['done'], key=f"c_{t['id']}_{i}")
+                    if is_done: done_count += 1
+                    if is_done != s['done']:
+                        s['done'] = is_done
                         has_change = True
-                    
-                    updated_subtasks.append(sub)
+                    updated_subs.append(s)
                 
-                # Hiển thị Progress Bar dựa trên checkbox
-                if len(subtasks) > 0:
-                    prog_percent = int((completed_count / len(subtasks)) * 100)
-                    st.progress(prog_percent)
-                    st.caption(f"Tiến độ: {prog_percent}%")
+                if len(subs) > 0:
+                    st.progress(done_count / len(subs))
                 
-                # Nút Lưu Checkbox (Nếu có thay đổi)
                 if has_change:
-                    for origin in tasks:
-                        if origin['id'] == t['id']:
-                            origin['subtasks'] = updated_subtasks
+                    for org in tasks:
+                        if org['id'] == t['id']: org['subtasks'] = updated_subs
                     save_tasks(tasks)
-                    st.rerun() # Refresh để cập nhật
-                
-                # Nút Hoàn thành Task lớn
-                if st.button("🎉 Hoàn thành Task này", key=f"fin_{t['id']}", use_container_width=True):
-                    for origin in tasks:
-                        if origin['id'] == t['id']: origin['status'] = 'Done'
-                    save_tasks(tasks)
-                    sync_to_gsheet(tasks)
                     st.rerun()
 
-else:
-    # Desktop View
+                col_act1, col_act2 = st.columns(2)
+                with col_act1:
+                    if st.button("🎉 Hoàn thành", key=f"fin_{t['id']}", use_container_width=True):
+                        for org in tasks:
+                            if org['id'] == t['id']: org['status'] = 'Done'
+                        save_tasks(tasks)
+                        sync_to_gsheet(tasks)
+                        st.rerun()
+                with col_act2:
+                    if st.button("🗑️ Xóa Task", key=f"del_{t['id']}", type="secondary", use_container_width=True):
+                        tasks = [x for x in tasks if x['id'] != t['id']]
+                        save_tasks(tasks)
+                        sync_to_gsheet(tasks)
+                        st.rerun()
+
+# === TAB 2: EISENHOWER ===
+with tab2:
+    st.caption("Ma trận ưu tiên công việc")
+    col1, col2 = st.columns(2)
+    
+    def render_matrix_card(col, title, color, code):
+        items = [t for t in pending_tasks if code in t['eisenhower']]
+        with col:
+            st.markdown(f"<div style='color:{color}; font-weight:bold; border-bottom:2px solid {color}'>{title} ({len(items)})</div>", unsafe_allow_html=True)
+            for t in items:
+                st.markdown(f"• {t['task_name']}")
+
+    render_matrix_card(col1, "🔥 DO FIRST (Q1)", "#ff4b4b", "Q1")
+    render_matrix_card(col2, "📅 SCHEDULE (Q2)", "#ffa421", "Q2")
+    render_matrix_card(col1, "🤝 DELEGATE (Q3)", "#3373c4", "Q3")
+    render_matrix_card(col2, "🗑️ DELETE (Q4)", "#6c757d", "Q4")
+
+# === TAB 3: DASHBOARD ===
+with tab3:
+    st.subheader("📊 Tổng hợp Trạng thái")
     if tasks:
         df = pd.DataFrame(tasks)
-        # Flatten subtasks for display
-        df['subtasks'] = df['subtasks'].apply(lambda x: "\n".join([f"[{'x' if i['done'] else ' '}] {i['name']}" for i in x]) if isinstance(x, list) else str(x))
-        st.dataframe(df, use_container_width=True, height=600, hide_index=True)
+        
+        # Metrics
+        total = len(df)
+        done = len(df[df['status'] == 'Done'])
+        pending = total - done
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Tổng Task", total)
+        m2.metric("Đã xong", done)
+        m3.metric("Còn lại", pending)
+        
+        st.divider()
+        st.caption("Chi tiết dữ liệu (Dạng bảng)")
+        
+        # Format lại subtask để hiển thị bảng
+        df_view = df.copy()
+        df_view['subtasks'] = df_view['subtasks'].apply(
+            lambda x: ", ".join([i['name'] for i in x]) if isinstance(x, list) else str(x)
+        )
+        
+        st.dataframe(
+            df_view[['task_name', 'status', 'priority', 'deadline', 'subtasks']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Chưa có dữ liệu")
